@@ -7,19 +7,17 @@ import psutil
 
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QFont, QKeySequence, QShortcut, QIcon, QPixmap, QAction
-from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QHBoxLayout, QSystemTrayIcon, QMenu
-)
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QHBoxLayout, QSystemTrayIcon, QMenu
 
 import win32gui
 import win32con
 
 APP_NAME = "UltraMeter"
-REFRESH_MS = 1000   # set 500 for 0.5s
+REFRESH_MS = 1000   # set 500 for ~0.5s updates
 MARGIN_PX = 2
 W, H = 230, 26
 
-# ---------- Paths & Settings ----------
+# ====== persistence ======
 def appdata_dir() -> str:
     p = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
     os.makedirs(p, exist_ok=True)
@@ -50,15 +48,15 @@ def exe_path() -> str:
         return sys.executable
     return os.path.abspath(__file__)
 
-# ---------- Autostart (HKCU\Run) ----------
+# ====== autostart (HKCU\Run) ======
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = APP_NAME
 
 def get_autostart() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as k:
-            val, _ = winreg.QueryValueEx(k, RUN_VALUE)
-            return bool(val)
+            _val, _t = winreg.QueryValueEx(k, RUN_VALUE)
+            return True
     except FileNotFoundError:
         return False
     except OSError:
@@ -77,11 +75,10 @@ def set_autostart(enable: bool) -> None:
     except OSError:
         pass
 
-# ---------- Tray area geometry ----------
+# ====== taskbar tray geometry ======
 def get_tray_rect() -> Optional[Tuple[int, int, int, int]]:
     tray = win32gui.FindWindow("Shell_TrayWnd", None)
-    if not tray:
-        return None
+    if not tray: return None
     child = None
     def enum_child(h, _):
         nonlocal child
@@ -99,7 +96,7 @@ def get_tray_rect() -> Optional[Tuple[int, int, int, int]]:
     except win32gui.error:
         return None
 
-# ---------- Units ----------
+# ====== units / coloring ======
 UNITS_MODE = "bits"   # "bits" or "bytes"
 FORCE_UNIT = None     # e.g., "MB/s", "Kbps", etc., or None for auto
 
@@ -141,7 +138,7 @@ class Snapshot:
     recv: int
     ts: float
 
-# ---------- UI: Corner strip ----------
+# ====== UI: strip ======
 class CornerStrip(QWidget):
     def __init__(self, app_icon: QIcon, up_pix: QPixmap, down_pix: QPixmap):
         super().__init__()
@@ -150,23 +147,17 @@ class CornerStrip(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowIcon(app_icon)
 
-        # Content layout
-        self.lbl_down_icon = QLabel()
-        self.lbl_down_icon.setPixmap(down_pix)
-        self.lbl_down = QLabel("⬇ …")
-        self.lbl_sep = QLabel(" | ")
-        self.lbl_sep.setStyleSheet("color:#8a8a8a;")
-        self.lbl_up_icon = QLabel()
-        self.lbl_up_icon.setPixmap(up_pix)
-        self.lbl_up = QLabel("⬆ …")
+        self.lbl_down_icon = QLabel();  self.lbl_down_icon.setPixmap(down_pix)
+        self.lbl_down = QLabel("↓ …")
+        self.lbl_sep = QLabel(" | ");   self.lbl_sep.setStyleSheet("color:#8a8a8a;")
+        self.lbl_up_icon = QLabel();    self.lbl_up_icon.setPixmap(up_pix)
+        self.lbl_up = QLabel("↑ …")
 
         for lbl in (self.lbl_down, self.lbl_up):
             f = QFont("Segoe UI", 9); f.setBold(True); lbl.setFont(f)
             lbl.setStyleSheet("color:white;")
 
-        # Pin button (toggle lock / click-through)
-        self.btn_pin = QLabel()
-        self.btn_pin.setToolTip("Pin/Unpin position")
+        self.btn_pin = QLabel()  # pin toggle
         self.btn_pin.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QHBoxLayout(self)
@@ -182,23 +173,20 @@ class CornerStrip(QWidget):
 
         self.resize(W, H)
 
-        # State
         self.click_through = True
         self._drag: Optional[QPoint] = None
 
-        # Pin icons (simple text fallback if image missing)
+        # pin icons (optional)
         self.pin_off = QPixmap(asset_path("pin_off.png")) if os.path.exists(asset_path("pin_off.png")) else None
         self.pin_on  = QPixmap(asset_path("pin_on.png"))  if os.path.exists(asset_path("pin_on.png"))  else None
-        self.update_pin_icon()
-
-        # Mouse handling
+        self._update_pin_icon()
         self.btn_pin.mousePressEvent = self._toggle_pin_click
 
-        # Shortcuts (power users)
+        # shortcuts
         QShortcut(QKeySequence("Ctrl+Shift+L"), self, activated=self.toggle_lock)
         QShortcut(QKeySequence("Ctrl+Shift+U"), self, activated=self.toggle_units)
 
-        # Apply persisted position/lock if any
+        # restore persisted state
         st = load_settings()
         if "pos" in st:
             self.move(st["pos"][0], st["pos"][1])
@@ -209,11 +197,11 @@ class CornerStrip(QWidget):
         else:
             self.set_locked(True)
 
-    # ----- Lock/Pin -----
+    # ----- behavior -----
     def set_locked(self, locked: bool):
         self.click_through = locked
-        self.apply_click_through(self.click_through)
-        self.update_pin_icon()
+        self._apply_click_through(self.click_through)
+        self._update_pin_icon()
         self._persist()
 
     def toggle_lock(self):
@@ -222,17 +210,17 @@ class CornerStrip(QWidget):
     def _toggle_pin_click(self, _e):
         self.toggle_lock()
 
-    def update_pin_icon(self):
+    def _update_pin_icon(self):
         if self.click_through:
             if self.pin_on:  self.btn_pin.setPixmap(self.pin_on)
             else:            self.btn_pin.setText("📌")
-            self.btn_pin.setToolTip("Currently pinned (click to unpin)")
+            self.btn_pin.setToolTip("Pinned (click to unpin and drag)")
         else:
             if self.pin_off: self.btn_pin.setPixmap(self.pin_off)
             else:            self.btn_pin.setText("📍")
-            self.btn_pin.setToolTip("Currently unpinned (drag me, then click to pin)")
+            self.btn_pin.setToolTip("Unpinned (drag me, then click to pin)")
 
-    def apply_click_through(self, enable: bool):
+    def _apply_click_through(self, enable: bool):
         hwnd = int(self.winId())
         ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
         if enable:
@@ -245,8 +233,8 @@ class CornerStrip(QWidget):
     def toggle_units(self):
         global UNITS_MODE
         UNITS_MODE = "bytes" if UNITS_MODE == "bits" else "bits"
+        st = load_settings(); st["units"] = UNITS_MODE; save_settings(st)
 
-    # ----- Dragging -----
     def mousePressEvent(self, e):
         if self.click_through: return
         if e.button() == Qt.MouseButton.LeftButton:
@@ -291,29 +279,28 @@ class CornerStrip(QWidget):
         st = load_settings()
         st["pos"] = [self.x(), self.y()]
         st["locked"] = self.click_through
-        st["units"] = UNITS_MODE
         save_settings(st)
 
-# ---------- App ----------
+# ====== app ======
 class App(QApplication):
     def __init__(self, argv):
         super().__init__(argv)
         self.setApplicationName(APP_NAME)
 
-        # Load icons (place yours in app/assets/)
         app_icon = QIcon(asset_path("app.ico")) if os.path.exists(asset_path("app.ico")) else QIcon()
         up_pix = QPixmap(asset_path("upload.png")) if os.path.exists(asset_path("upload.png")) else QPixmap()
         down_pix = QPixmap(asset_path("download.png")) if os.path.exists(asset_path("download.png")) else QPixmap()
 
-        # Strip
         self.strip = CornerStrip(app_icon, up_pix, down_pix)
-        if not self.strip.isVisible():
-            self.strip.show()
+        self.strip.show()
 
-        # Tray
         self.tray = QSystemTrayIcon(app_icon if not app_icon.isNull() else QIcon())
         self.tray.setToolTip(APP_NAME)
         menu = QMenu()
+
+        dock_act = QAction("Dock to right corner")
+        dock_act.triggered.connect(self.strip.snap_to_tray)
+        menu.addAction(dock_act)
 
         self.act_show_hide = QAction("Hide Meter")
         self.act_show_hide.triggered.connect(self.toggle_strip)
@@ -342,28 +329,23 @@ class App(QApplication):
         menu.addAction(quit_act)
 
         self.tray.setContextMenu(menu)
+        # Only toggle on **double-click** to avoid accidental hides from click-through
         self.tray.activated.connect(self.tray_click)
         self.tray.show()
 
-        # Timers
         self.prev: Optional[Snapshot] = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(REFRESH_MS)
 
-        self.snap_timer = QTimer(self)
-        self.snap_timer.timeout.connect(self.strip.snap_to_tray)
-        self.snap_timer.start(5000)
-
-        # Restore units
+        # restore units mode
         st = load_settings()
         if st.get("units") in ("bits", "bytes"):
             global UNITS_MODE
             UNITS_MODE = st["units"]
 
     def tray_click(self, reason):
-        # Left click -> show/hide
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.toggle_strip()
 
     def toggle_strip(self):
@@ -375,7 +357,6 @@ class App(QApplication):
             self.act_show_hide.setText("Hide Meter")
 
     def quit_app(self):
-        # Persist on exit
         self.strip._persist()
         self.tray.hide()
         self.quit()
@@ -390,6 +371,7 @@ class App(QApplication):
         dt = max(1e-6, now - self.prev.ts)
         up_Bps = (c.bytes_sent - self.prev.sent) / dt
         dn_Bps = (c.bytes_recv - self.prev.recv) / dt
+
         up_Mbps = (up_Bps * 8.0) / 1_000_000
         dn_Mbps = (dn_Bps * 8.0) / 1_000_000
 
